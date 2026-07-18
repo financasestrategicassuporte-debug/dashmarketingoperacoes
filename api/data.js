@@ -11,6 +11,45 @@ const SHEET_ID = process.env.SHEET_ID || '1MW_dyf0VOHULceCCtY7FkCR_tLCCkM6YqPY-T
 const SHEET_GID = process.env.SHEET_GID || '1467696356';
 const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`;
 
+// Fallback caso o runtime não tenha `fetch` global (Node < 18 em algumas
+// configurações antigas de deploy). Usa https nativo do Node nesse caso.
+async function fetchCsv(url) {
+  if (typeof fetch === 'function') {
+    const r = await fetch(url, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; DashboardBot/1.0)',
+        Accept: 'text/csv,*/*',
+      },
+    });
+    return { ok: r.ok, status: r.status, contentType: r.headers.get('content-type') || '', text: await r.text() };
+  }
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const doRequest = (u, redirects = 0) => {
+      https
+        .get(
+          u,
+          { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DashboardBot/1.0)', Accept: 'text/csv,*/*' } },
+          (r) => {
+            if ([301, 302, 303, 307, 308].includes(r.statusCode) && r.headers.location && redirects < 5) {
+              doRequest(r.headers.location, redirects + 1);
+              return;
+            }
+            let body = '';
+            r.setEncoding('utf8');
+            r.on('data', (chunk) => (body += chunk));
+            r.on('end', () =>
+              resolve({ ok: r.statusCode >= 200 && r.statusCode < 300, status: r.statusCode, contentType: r.headers['content-type'] || '', text: body })
+            );
+          }
+        )
+        .on('error', reject);
+    };
+    doRequest(url);
+  });
+}
+
 // ---------- CSV parsing (sem dependências externas) ----------
 function parseCSV(text) {
   const rows = [];
@@ -138,17 +177,10 @@ module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=60');
 
   try {
-    const csvRes = await fetch(CSV_URL, {
-      redirect: 'follow',
-      headers: {
-        // alguns proxies do Google se comportam diferente sem um UA de navegador
-        'User-Agent': 'Mozilla/5.0 (compatible; DashboardBot/1.0)',
-        Accept: 'text/csv,*/*',
-      },
-    });
+    const csvRes = await fetchCsv(CSV_URL);
 
-    const contentType = csvRes.headers.get('content-type') || '';
-    const csvText = await csvRes.text();
+    const contentType = csvRes.contentType || '';
+    const csvText = csvRes.text;
 
     if (!csvRes.ok) {
       throw new Error(`Falha ao buscar a planilha (HTTP ${csvRes.status})`);
