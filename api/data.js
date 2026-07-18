@@ -1,6 +1,7 @@
 // api/data.js
 // Puxa os leads diretamente da planilha do Google Sheets (exportação CSV pública)
-// e devolve no formato que o dashboard (index.html) já espera em `leadsList`.
+// e devolve no formato que o dashboard (index.html) já espera:
+//   { leadsList, creativesList, campaignsList }
 //
 // A planilha precisa estar como "Qualquer pessoa com o link -> Leitor".
 // Você pode trocar a planilha/aba sem editar código, via variáveis de ambiente
@@ -51,7 +52,6 @@ function parseFaturamento(raw) {
   const hasMil = /mil\b/i.test(s);
   const hasK = /\d\s*k\b/i.test(s);
 
-  // "R$30.000" ou "30.000" -> remove o ponto de milhar (formato BR)
   let cleaned = s.replace(/R\$\s?/gi, '').replace(/(\d)\.(\d{3})(?!\d)/g, '$1$2');
 
   const nums = cleaned.match(/\d+(?:[.,]\d+)?/g);
@@ -61,8 +61,7 @@ function parseFaturamento(raw) {
   if (hasK || hasMil) vals = vals.map((v) => (v < 1000 ? v * 1000 : v));
 
   if (!vals.length) return null;
-  // usa o limite inferior da faixa (mais conservador para qualificação)
-  return Math.min(...vals);
+  return Math.min(...vals); // limite inferior da faixa (conservador)
 }
 
 function qualificationFor(value) {
@@ -87,8 +86,8 @@ function parseRowDate(raw) {
 
   let [, p1, p2, year, h, min, sec] = m;
   let day, month;
-  if (hasComma) { day = p1; month = p2; } // DD/MM/YYYY
-  else { month = p1; day = p2; } // M/D/YYYY
+  if (hasComma) { day = p1; month = p2; }
+  else { month = p1; day = p2; }
 
   const d = new Date(Number(year), Number(month) - 1, Number(day), Number(h), Number(min), Number(sec || 0));
   return isNaN(d.getTime()) ? null : d;
@@ -104,7 +103,7 @@ function rangeToWindow(range) {
     case 'Hoje': return { start: today, end: addDays(today, 1) };
     case 'Ontem': return { start: addDays(today, -1), end: today };
     case 'Essa Semana': {
-      const dow = today.getDay(); // 0=domingo
+      const dow = today.getDay();
       return { start: addDays(today, -dow), end: addDays(today, 1) };
     }
     case 'Esse Mês': return { start: new Date(now.getFullYear(), now.getMonth(), 1), end: addDays(today, 1) };
@@ -116,11 +115,10 @@ function rangeToWindow(range) {
     case '14 dias': return { start: addDays(today, -14), end: addDays(today, 1) };
     case '30 dias': return { start: addDays(today, -30), end: addDays(today, 1) };
     case '90 dias': return { start: addDays(today, -90), end: addDays(today, 1) };
-    default: return null; // sem filtro
+    default: return null;
   }
 }
 
-// ---------- Auxiliares de exibição ----------
 const AVATAR_COLORS = ['#7c3aed', '#2563eb', '#16a34a', '#f59e0b', '#0891b2', '#dc2626'];
 
 function initialsOf(name) {
@@ -140,14 +138,33 @@ module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=60');
 
   try {
-    const csvRes = await fetch(CSV_URL);
-    if (!csvRes.ok) throw new Error(`Falha ao buscar a planilha (HTTP ${csvRes.status})`);
+    const csvRes = await fetch(CSV_URL, {
+      redirect: 'follow',
+      headers: {
+        // alguns proxies do Google se comportam diferente sem um UA de navegador
+        'User-Agent': 'Mozilla/5.0 (compatible; DashboardBot/1.0)',
+        Accept: 'text/csv,*/*',
+      },
+    });
+
+    const contentType = csvRes.headers.get('content-type') || '';
     const csvText = await csvRes.text();
 
-    const rows = parseCSV(csvText).filter((r) => r.some((cell) => (cell || '').trim() !== ''));
-    if (!rows.length) throw new Error('Planilha vazia');
+    if (!csvRes.ok) {
+      throw new Error(`Falha ao buscar a planilha (HTTP ${csvRes.status})`);
+    }
+    // Se a planilha não estiver realmente pública, o Google devolve uma
+    // página HTML de login em vez do CSV — detectamos isso explicitamente
+    // em vez de tentar (e falhar silenciosamente) fazer parse como CSV.
+    if (contentType.includes('text/html') || /^\s*<!DOCTYPE/i.test(csvText)) {
+      throw new Error(
+        'A planilha retornou HTML em vez de CSV — verifique se o compartilhamento está como "Qualquer pessoa com o link -> Leitor".'
+      );
+    }
 
-    // Descobre a linha de cabeçalho (a primeira com "Nome" numa das colunas)
+    const rows = parseCSV(csvText).filter((r) => r.some((cell) => (cell || '').trim() !== ''));
+    if (!rows.length) throw new Error('Planilha vazia ou sem linhas com dados.');
+
     const headerIdx = rows.findIndex((r) => r.some((c) => /nome/i.test(c)));
     const header = headerIdx >= 0 ? rows[headerIdx] : rows[0];
     const dataRows = rows.slice((headerIdx >= 0 ? headerIdx : 0) + 1);
@@ -156,8 +173,6 @@ module.exports = async (req, res) => {
     const idx = {
       data: col('Data/Hora'),
       nome: col('Nome'),
-      whatsapp: col('WhatsApp'),
-      email: col('Email'),
       faturamento: col('Faturamento'),
       area: col('Área'),
       utmCampaign: col('utm_campaign'),
@@ -170,7 +185,7 @@ module.exports = async (req, res) => {
     const leads = [];
     dataRows.forEach((r, i) => {
       const nome = idx.nome >= 0 ? (r[idx.nome] || '').trim() : '';
-      if (!nome) return; // ignora linhas incompletas (sem nome preenchido)
+      if (!nome) return;
 
       const dateRaw = idx.data >= 0 ? r[idx.data] : '';
       const parsedDate = parseRowDate(dateRaw);
@@ -193,23 +208,20 @@ module.exports = async (req, res) => {
         qualColor: q.qualColor,
         data: formatDataLabel(parsedDate),
         _faturamentoValor: faturamentoValor,
-        _campaignRaw: (idx.utmCampaign >= 0 ? r[idx.utmCampaign] : '') || '',
-        _contentRaw: (idx.utmContent >= 0 ? r[idx.utmContent] : '') || '',
+        _campaignRaw: (idx.utmCampaign >= 0 ? r[idx.utmCampaign] : '') || '(sem campanha)',
+        _contentRaw: (idx.utmContent >= 0 ? r[idx.utmContent] : '') || '(sem criativo)',
       });
     });
 
-    // Agrupa por criativo (utm_content) só com o que dá pra saber pela planilha:
-    // quantidade de leads e quantos qualificados. Custo/CTR/CPC dependem da API
-    // do Meta Ads e não estão nesta planilha — ficam como "-" aqui.
+    // ---- agrupamento por criativo (utm_content) ----
     const byContent = new Map();
     leads.forEach((l) => {
-      const key = l._contentRaw || '(sem criativo)';
+      const key = l._contentRaw;
       if (!byContent.has(key)) byContent.set(key, { nome: key, camp: l._campaignRaw, leads: 0, qualif: 0 });
       const g = byContent.get(key);
       g.leads += 1;
       if (l._faturamentoValor != null && l._faturamentoValor >= 50000) g.qualif += 1;
     });
-
     const rankColors = ['#16a34a', '#2563eb', '#94a3b8', '#94a3b8', '#94a3b8', '#94a3b8'];
     const creativesList = Array.from(byContent.values())
       .sort((a, b) => b.qualif - a.qualif || b.leads - a.leads)
@@ -233,12 +245,51 @@ module.exports = async (req, res) => {
         leads: String(g.leads),
       }));
 
-    // remove os campos internos (_...) antes de responder
-    const leadsList = leads.map(({ _faturamentoValor, _campaignRaw, _contentRaw, ...rest }) => rest)
+    // ---- agrupamento por campanha (utm_campaign) — alimenta a aba "Campanhas" ----
+    const byCampaign = new Map();
+    leads.forEach((l) => {
+      const key = l._campaignRaw;
+      if (!byCampaign.has(key)) byCampaign.set(key, { camp: key, total: 0, qualif: 0 });
+      const g = byCampaign.get(key);
+      g.total += 1;
+      if (l._faturamentoValor != null && l._faturamentoValor >= 50000) g.qualif += 1;
+    });
+    const maxQualif = Math.max(1, ...Array.from(byCampaign.values()).map((g) => g.qualif));
+    const campaignsList = Array.from(byCampaign.values())
+      .sort((a, b) => b.qualif - a.qualif || b.total - a.total)
+      .map((g) => {
+        const txQualif = g.total ? (g.qualif / g.total) * 100 : 0;
+        return {
+          camp: g.camp,
+          leadsQualif: String(g.qualif),
+          leadsQualifBarWidth: `${Math.round((g.qualif / maxQualif) * 100)}%`,
+          totalLeads: String(g.total),
+          invest: '-',
+          custoLead: '-',
+          ctr: '-',
+          cpc: '-',
+          txQualif: `${txQualif.toFixed(2)}%`,
+          txQualifBg: txQualif > 0 ? '#dcfce7' : '#f5f3ff',
+          txQualifColor: txQualif > 0 ? '#15803d' : '#7c3aed',
+        };
+      });
+
+    const leadsList = leads
+      .map(({ _faturamentoValor, _campaignRaw, _contentRaw, ...rest }) => rest)
       .sort((a, b) => (a.data < b.data ? 1 : -1));
 
-    res.status(200).json({ leadsList, creativesList, source: 'google-sheets', fetchedAt: new Date().toISOString() });
+    res.status(200).json({
+      leadsList,
+      creativesList,
+      campaignsList,
+      source: 'google-sheets',
+      totalRowsInSheet: dataRows.length,
+      totalLeadsAfterFilter: leads.length,
+      fetchedAt: new Date().toISOString(),
+    });
   } catch (err) {
+    // Devolve o erro real no corpo — abra /api/data direto no navegador
+    // para ver essa mensagem quando o conector aparecer como "offline".
     res.status(500).json({ error: err.message });
   }
 };
